@@ -538,6 +538,24 @@ http
         if (req.method === "PUT") {
           const progress = await readBody(req);
 
+          // Vorhandenen Stand laden, damit partielle Updates keinen Progress resetten
+          const existingRows = await db(
+            "SELECT * FROM user_progress WHERE user_id = ?",
+            [auth.sub],
+          );
+          const existing = existingRows[0] || {};
+
+          const level =
+            progress.level ?? existing.level ?? null;
+          const completedModules =
+            progress.completedModules ?? JSON.parse(existing.completed_modules_json || "[]");
+          const quizScores =
+            progress.quizScores ?? JSON.parse(existing.quiz_scores_json || "{}");
+          const totalProgress =
+            progress.totalProgress ?? existing.total_progress ?? 0;
+          const trophies =
+            progress.trophies ?? JSON.parse(existing.trophies_json || "[]");
+
           await db(
             `INSERT INTO user_progress
              (user_id,level,completed_modules_json,quiz_scores_json,total_progress,trophies_json,updated_at)
@@ -551,15 +569,21 @@ http
                updated_at = CURRENT_TIMESTAMP`,
             [
               auth.sub,
-              progress.level || null,
-              JSON.stringify(progress.completedModules || []),
-              JSON.stringify(progress.quizScores || {}),
-              progress.totalProgress || 0,
-              JSON.stringify(progress.trophies || []),
+              level,
+              JSON.stringify(completedModules),
+              JSON.stringify(quizScores),
+              totalProgress,
+              JSON.stringify(trophies),
             ],
           );
 
-          return json(res, 200, progress);
+          return json(res, 200, {
+            level,
+            completedModules,
+            quizScores,
+            totalProgress,
+            trophies,
+          });
         }
       }
 
