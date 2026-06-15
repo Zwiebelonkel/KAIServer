@@ -107,6 +107,16 @@ async function migrate() {
   for (const statement of statements) {
     await db(statement);
   }
+
+  // Ensure module_completions table exists even when schema.sql predates this feature
+  await db(
+    `CREATE TABLE IF NOT EXISTS module_completions (
+       id          TEXT NOT NULL PRIMARY KEY,
+       user_id     TEXT NOT NULL,
+       module_id   TEXT NOT NULL,
+       completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     )`,
+  );
 }
 
 async function replaceModule(module, index = 0) {
@@ -356,6 +366,41 @@ http
         }
       }
 
+      // ── Stats: tägl. Modulabschlüsse (Admin) ──────────────────────────────
+      if (
+        url.pathname === "/admin/stats/module-completions-daily" &&
+        req.method === "GET"
+      ) {
+        const rows = await db(
+          `SELECT
+             m.id        AS moduleId,
+             m.title     AS title,
+             DATE(c.completed_at) AS day,
+             COUNT(c.id) AS completions
+           FROM learning_modules m
+           LEFT JOIN module_completions c ON c.module_id = m.id
+           GROUP BY m.id, DATE(c.completed_at)
+           ORDER BY m.sort_order, day`,
+        );
+
+        return json(res, 200, rows);
+      }
+
+      // ── Stats: Gesamtübersicht (Admin) ────────────────────────────────────
+      if (url.pathname === "/admin/stats/overview" && req.method === "GET") {
+        const [users, mods, completions] = await Promise.all([
+          db("SELECT COUNT(*) AS count FROM users"),
+          db("SELECT COUNT(*) AS count FROM learning_modules"),
+          db("SELECT COUNT(*) AS count FROM module_completions"),
+        ]);
+
+        return json(res, 200, {
+          totalUsers: users[0].count,
+          totalModules: mods[0].count,
+          totalCompletions: completions[0].count,
+        });
+      }
+
       if (url.pathname === "/modules" && req.method === "GET") {
         const published = await getModules();
         return json(
@@ -442,6 +487,26 @@ http
               displayName: rows[0].display_name,
             })
           : json(res, 404, { error: "User nicht gefunden." });
+      }
+
+      // ── Modulabschluss speichern ───────────────────────────────────────────
+      if (url.pathname === "/me/module-completion" && req.method === "POST") {
+        const auth = verifyToken(req);
+        if (!auth) return json(res, 401, { error: "Nicht angemeldet." });
+
+        const { moduleId } = await readBody(req);
+
+        if (!moduleId) {
+          return json(res, 400, { error: "moduleId fehlt." });
+        }
+
+        await db(
+          `INSERT INTO module_completions (id, user_id, module_id)
+           VALUES (?, ?, ?)`,
+          [crypto.randomUUID(), auth.sub, moduleId],
+        );
+
+        return json(res, 201, { ok: true });
       }
 
       if (url.pathname === "/me/progress") {
