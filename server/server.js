@@ -148,7 +148,7 @@ async function replaceModule(module, index = 0) {
        (id,module_id,question,options_json,correct_index,explanation,image_url,sort_order)
        VALUES (?,?,?,?,?,?,?,?)`,
       [
-        question.id,
+        `${module.id}-q-${qIndex}`,
         module.id,
         question.question,
         JSON.stringify(question.options),
