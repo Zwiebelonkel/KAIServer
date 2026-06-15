@@ -401,6 +401,31 @@ http
         });
       }
 
+      if (
+  url.pathname.startsWith("/modules/") &&
+  url.pathname.endsWith("/complete") &&
+  req.method === "POST"
+) {
+  const parts = url.pathname.split("/");
+  const moduleId = decodeURIComponent(parts[2]);
+  const auth = verifyToken(req);
+  const body = await readBody(req);
+
+  const userId = auth?.sub || body.anonymousId;
+
+  if (!userId) {
+    return json(res, 400, { error: "userId oder anonymousId fehlt." });
+  }
+
+  await db(
+    `INSERT INTO module_completions (id, user_id, module_id)
+     VALUES (?, ?, ?)`,
+    [crypto.randomUUID(), userId, moduleId],
+  );
+
+  return json(res, 201, { ok: true });
+}
+
       if (url.pathname === "/modules" && req.method === "GET") {
         const published = await getModules();
         return json(
