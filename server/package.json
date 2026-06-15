@@ -1,0 +1,14 @@
+{
+  "name": "kai-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "migrate": "node -e \"fetch((process.env.KAI_API_URL||'http://localhost:10000')+'/admin/migrate',{method:'POST'}).then(r=>r.text()).then(console.log)\"",
+    "seed": "node -e \"fetch((process.env.KAI_API_URL||'http://localhost:10000')+'/admin/seed',{method:'POST'}).then(r=>r.text()).then(console.log)\""
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
