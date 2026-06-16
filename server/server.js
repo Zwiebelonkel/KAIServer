@@ -143,6 +143,16 @@ async function migrate() {
        sort_order INTEGER NOT NULL DEFAULT 0
      )`,
   );
+
+  // Optionales Video pro Lernmodul.
+  await db(
+    `CREATE TABLE IF NOT EXISTS module_video_link (
+       module_id TEXT PRIMARY KEY,
+       video_url TEXT NOT NULL,
+       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     )`,
+  );
 }
 
 async function replaceModule(module, index = 0) {
@@ -171,6 +181,16 @@ async function replaceModule(module, index = 0) {
   await db("DELETE FROM module_lesson_images WHERE module_id = ?", [
     module.id,
   ]);
+  await db("DELETE FROM module_video_link WHERE module_id = ?", [module.id]);
+
+  if (module.videoLink) {
+    await db(
+      `INSERT INTO module_video_link
+       (module_id,video_url,updated_at)
+       VALUES (?,?,CURRENT_TIMESTAMP)`,
+      [module.id, module.videoLink],
+    );
+  }
 
   for (const [gIndex, item] of (module.glossary || []).entries()) {
     if (!item.term && !item.definition) continue;
@@ -317,6 +337,7 @@ function moduleFromRows(rows) {
         icon: row.icon,
         content: row.content,
         minLevel: row.min_level,
+        videoLink: row.video_url || undefined,
         isPublished: Boolean(row.is_published),
         sortOrder: row.sort_order,
         glossary: [],
@@ -371,6 +392,7 @@ async function getModules(moduleId, { admin = false } = {}) {
   const rows = await db(
     `SELECT
        m.*,
+       v.video_url,
        g.id glossary_id,
        g.term,
        g.definition,
@@ -385,6 +407,7 @@ async function getModules(moduleId, { admin = false } = {}) {
        q.explanation,
        q.image_url
      FROM learning_modules m
+     LEFT JOIN module_video_link v ON v.module_id = m.id
      LEFT JOIN module_glossary_items g ON g.module_id = m.id
      LEFT JOIN module_lesson_images li ON li.module_id = m.id
      LEFT JOIN module_quiz_questions q ON q.module_id = m.id
@@ -543,7 +566,8 @@ http
           .replace(/[^a-zA-Z0-9:-]/g, "")
           .slice(0, 80);
 
-        const userId = auth?.sub || `anonymous:${anonymousId || crypto.randomUUID()}`;
+        const userId =
+          auth?.sub || `anonymous:${anonymousId || crypto.randomUUID()}`;
 
         await recordModuleCompletion(userId, moduleId);
         return json(res, 200, { ok: true });
