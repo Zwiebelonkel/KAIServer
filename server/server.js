@@ -111,10 +111,22 @@ async function migrate() {
   // Ensure module_completions table exists even when schema.sql predates this feature
   await db(
     `CREATE TABLE IF NOT EXISTS module_completions (
-       id          TEXT NOT NULL PRIMARY KEY,
-       user_id     TEXT NOT NULL,
-       module_id   TEXT NOT NULL,
+       id           TEXT NOT NULL PRIMARY KEY,
+       user_id      TEXT NOT NULL,
+       module_id    TEXT NOT NULL,
        completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+     )`,
+  );
+
+  // Lesson images inserted by admins at configurable places inside a lesson
+  await db(
+    `CREATE TABLE IF NOT EXISTS module_lesson_images (
+       id          TEXT NOT NULL PRIMARY KEY,
+       module_id   TEXT NOT NULL,
+       image_url   TEXT NOT NULL,
+       alt         TEXT NOT NULL,
+       placement   TEXT NOT NULL,
+       sort_order  INTEGER NOT NULL DEFAULT 0
      )`,
   );
 }
@@ -142,6 +154,9 @@ async function replaceModule(module, index = 0) {
   await db("DELETE FROM module_quiz_questions WHERE module_id = ?", [
     module.id,
   ]);
+  await db("DELETE FROM module_lesson_images WHERE module_id = ?", [
+    module.id,
+  ]);
 
   for (const [gIndex, item] of (module.glossary || []).entries()) {
     await db(
@@ -152,13 +167,31 @@ async function replaceModule(module, index = 0) {
     );
   }
 
+  for (const [imageIndex, image] of (module.lessonImages || []).entries()) {
+    if (!image.imageUrl) continue;
+
+    await db(
+      `INSERT INTO module_lesson_images
+       (id,module_id,image_url,alt,placement,sort_order)
+       VALUES (?,?,?,?,?,?)`,
+      [
+        image.id || `${module.id}-img-${imageIndex}`,
+        module.id,
+        image.imageUrl,
+        image.alt || `Bild ${imageIndex + 1} zu ${module.title}`,
+        image.placement || "after-content",
+        imageIndex,
+      ],
+    );
+  }
+
   for (const [qIndex, question] of (module.quiz || []).entries()) {
     await db(
       `INSERT INTO module_quiz_questions
        (id,module_id,question,options_json,correct_index,explanation,image_url,sort_order)
        VALUES (?,?,?,?,?,?,?,?)`,
       [
-        `${module.id}-q-${qIndex}`,
+        question.id || `${module.id}-q-${qIndex}`,
         module.id,
         question.question,
         JSON.stringify(question.options),
@@ -260,6 +293,7 @@ function moduleFromRows(rows) {
         isPublished: Boolean(row.is_published),
         sortOrder: row.sort_order,
         glossary: [],
+        lessonImages: [],
         quiz: [],
       });
     }
@@ -268,6 +302,18 @@ function moduleFromRows(rows) {
 
     if (row.glossary_id && !mod.glossary.some((g) => g.term === row.term)) {
       mod.glossary.push({ term: row.term, definition: row.definition });
+    }
+
+    if (
+      row.lesson_image_id &&
+      !mod.lessonImages.some((image) => image.id === row.lesson_image_id)
+    ) {
+      mod.lessonImages.push({
+        id: row.lesson_image_id,
+        imageUrl: row.lesson_image_url,
+        alt: row.lesson_image_alt,
+        placement: row.lesson_image_placement,
+      });
     }
 
     if (row.quiz_id && !mod.quiz.some((q) => q.id === row.quiz_id)) {
@@ -298,6 +344,10 @@ async function getModules(moduleId, { admin = false } = {}) {
        g.id glossary_id,
        g.term,
        g.definition,
+       li.id lesson_image_id,
+       li.image_url lesson_image_url,
+       li.alt lesson_image_alt,
+       li.placement lesson_image_placement,
        q.id quiz_id,
        q.question,
        q.options_json,
@@ -306,9 +356,14 @@ async function getModules(moduleId, { admin = false } = {}) {
        q.image_url
      FROM learning_modules m
      LEFT JOIN module_glossary_items g ON g.module_id = m.id
+     LEFT JOIN module_lesson_images li ON li.module_id = m.id
      LEFT JOIN module_quiz_questions q ON q.module_id = m.id
      ${where}
-     ORDER BY m.sort_order, g.sort_order, q.sort_order`,
+     ORDER BY
+       m.sort_order,
+       g.sort_order,
+       li.sort_order,
+       q.sort_order`,
     moduleId ? [moduleId] : [],
   );
 
@@ -402,29 +457,29 @@ http
       }
 
       if (
-  url.pathname.startsWith("/modules/") &&
-  url.pathname.endsWith("/complete") &&
-  req.method === "POST"
-) {
-  const parts = url.pathname.split("/");
-  const moduleId = decodeURIComponent(parts[2]);
-  const auth = verifyToken(req);
-  const body = await readBody(req);
+        url.pathname.startsWith("/modules/") &&
+        url.pathname.endsWith("/complete") &&
+        req.method === "POST"
+      ) {
+        const parts = url.pathname.split("/");
+        const moduleId = decodeURIComponent(parts[2]);
+        const auth = verifyToken(req);
+        const body = await readBody(req);
 
-  const userId = auth?.sub || body.anonymousId;
+        const userId = auth?.sub || body.anonymousId;
 
-  if (!userId) {
-    return json(res, 400, { error: "userId oder anonymousId fehlt." });
-  }
+        if (!userId) {
+          return json(res, 400, { error: "userId oder anonymousId fehlt." });
+        }
 
-  await db(
-    `INSERT INTO module_completions (id, user_id, module_id)
-     VALUES (?, ?, ?)`,
-    [crypto.randomUUID(), userId, moduleId],
-  );
+        await db(
+          `INSERT INTO module_completions (id, user_id, module_id)
+           VALUES (?, ?, ?)`,
+          [crypto.randomUUID(), userId, moduleId],
+        );
 
-  return json(res, 201, { ok: true });
-}
+        return json(res, 201, { ok: true });
+      }
 
       if (url.pathname === "/modules" && req.method === "GET") {
         const published = await getModules();
@@ -570,12 +625,13 @@ http
           );
           const existing = existingRows[0] || {};
 
-          const level =
-            progress.level ?? existing.level ?? null;
+          const level = progress.level ?? existing.level ?? null;
           const completedModules =
-            progress.completedModules ?? JSON.parse(existing.completed_modules_json || "[]");
+            progress.completedModules ??
+            JSON.parse(existing.completed_modules_json || "[]");
           const quizScores =
-            progress.quizScores ?? JSON.parse(existing.quiz_scores_json || "{}");
+            progress.quizScores ??
+            JSON.parse(existing.quiz_scores_json || "{}");
           const totalProgress =
             progress.totalProgress ?? existing.total_progress ?? 0;
           const trophies =
