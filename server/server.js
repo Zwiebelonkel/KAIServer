@@ -42,11 +42,13 @@ async function readBody(req) {
 
 function encodeArg(value) {
   if (value === null || value === undefined) return { type: "null" };
+
   if (typeof value === "number") {
     return Number.isInteger(value)
       ? { type: "integer", value: String(value) }
       : { type: "float", value };
   }
+
   return { type: "text", value: String(value) };
 }
 
@@ -68,7 +70,13 @@ async function db(sql, args = []) {
       },
       body: JSON.stringify({
         requests: [
-          { type: "execute", stmt: { sql, args: args.map(encodeArg) } },
+          {
+            type: "execute",
+            stmt: {
+              sql,
+              args: args.map(encodeArg),
+            },
+          },
           { type: "close" },
         ],
       }),
@@ -108,25 +116,31 @@ async function migrate() {
     await db(statement);
   }
 
-  // Ensure module_completions table exists even when schema.sql predates this feature
+  // Sicherheit: existiert auch, falls schema.sql im Deployment veraltet ist.
   await db(
     `CREATE TABLE IF NOT EXISTS module_completions (
-       id           TEXT NOT NULL PRIMARY KEY,
-       user_id      TEXT NOT NULL,
-       module_id    TEXT NOT NULL,
-       completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+       id TEXT PRIMARY KEY,
+       user_id TEXT NOT NULL,
+       module_id TEXT NOT NULL,
+       completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       UNIQUE(user_id, module_id)
      )`,
   );
 
-  // Lesson images inserted by admins at configurable places inside a lesson
+  await db(
+    `CREATE INDEX IF NOT EXISTS idx_module_completions_module_completed_at
+       ON module_completions(module_id, completed_at)`,
+  );
+
+  // Wichtig für hochgeladene Base64-Lektionsbilder.
   await db(
     `CREATE TABLE IF NOT EXISTS module_lesson_images (
-       id          TEXT NOT NULL PRIMARY KEY,
-       module_id   TEXT NOT NULL,
-       image_url   TEXT NOT NULL,
-       alt         TEXT NOT NULL,
-       placement   TEXT NOT NULL,
-       sort_order  INTEGER NOT NULL DEFAULT 0
+       id TEXT PRIMARY KEY,
+       module_id TEXT NOT NULL,
+       image_url TEXT NOT NULL,
+       alt TEXT NOT NULL,
+       placement TEXT NOT NULL,
+       sort_order INTEGER NOT NULL DEFAULT 0
      )`,
   );
 }
@@ -159,11 +173,19 @@ async function replaceModule(module, index = 0) {
   ]);
 
   for (const [gIndex, item] of (module.glossary || []).entries()) {
+    if (!item.term && !item.definition) continue;
+
     await db(
       `INSERT INTO module_glossary_items
        (id,module_id,term,definition,sort_order)
        VALUES (?,?,?,?,?)`,
-      [`${module.id}-g-${gIndex}`, module.id, item.term, item.definition, gIndex],
+      [
+        `${module.id}-g-${gIndex}`,
+        module.id,
+        item.term,
+        item.definition,
+        gIndex,
+      ],
     );
   }
 
@@ -175,7 +197,7 @@ async function replaceModule(module, index = 0) {
        (id,module_id,image_url,alt,placement,sort_order)
        VALUES (?,?,?,?,?,?)`,
       [
-        image.id || `${module.id}-img-${imageIndex}`,
+        image.id || `${module.id}-image-${imageIndex}`,
         module.id,
         image.imageUrl,
         image.alt || `Bild ${imageIndex + 1} zu ${module.title}`,
@@ -186,6 +208,8 @@ async function replaceModule(module, index = 0) {
   }
 
   for (const [qIndex, question] of (module.quiz || []).entries()) {
+    if (!question.question) continue;
+
     await db(
       `INSERT INTO module_quiz_questions
        (id,module_id,question,options_json,correct_index,explanation,image_url,sort_order)
@@ -194,9 +218,9 @@ async function replaceModule(module, index = 0) {
         question.id || `${module.id}-q-${qIndex}`,
         module.id,
         question.question,
-        JSON.stringify(question.options),
-        question.correctIndex,
-        question.explanation,
+        JSON.stringify(question.options || []),
+        question.correctIndex || 0,
+        question.explanation || "",
         question.imageUrl || null,
         qIndex,
       ],
@@ -245,6 +269,7 @@ function verifyToken(req) {
     .digest("base64url");
 
   if (sig.length !== expected.length) return null;
+
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
     return null;
   }
@@ -255,6 +280,7 @@ function verifyToken(req) {
 
 async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
+
   const hash = await new Promise((resolve, reject) =>
     crypto.scrypt(password, salt, 64, (error, key) =>
       error ? reject(error) : resolve(key.toString("hex")),
@@ -266,6 +292,7 @@ async function hashPassword(password) {
 
 async function verifyPassword(password, stored) {
   const [salt, hash] = stored.split(":");
+
   const candidate = await new Promise((resolve, reject) =>
     crypto.scrypt(password, salt, 64, (error, key) =>
       error ? reject(error) : resolve(key.toString("hex")),
@@ -301,7 +328,10 @@ function moduleFromRows(rows) {
     const mod = map.get(row.id);
 
     if (row.glossary_id && !mod.glossary.some((g) => g.term === row.term)) {
-      mod.glossary.push({ term: row.term, definition: row.definition });
+      mod.glossary.push({
+        term: row.term,
+        definition: row.definition,
+      });
     }
 
     if (
@@ -370,6 +400,43 @@ async function getModules(moduleId, { admin = false } = {}) {
   return moduleFromRows(rows);
 }
 
+async function getModuleCompletionStats(moduleId) {
+  return db(
+    `SELECT date(completed_at) AS day, COUNT(*) AS completions
+     FROM module_completions
+     WHERE module_id = ?
+     GROUP BY date(completed_at)
+     ORDER BY day`,
+    [moduleId],
+  );
+}
+
+async function recordModuleCompletion(userId, moduleId) {
+  await db(
+    `INSERT OR IGNORE INTO module_completions
+     (id,user_id,module_id)
+     VALUES (?,?,?)`,
+    [`${userId}:${moduleId}`, userId, moduleId],
+  );
+}
+
+async function recordNewCompletions(userId, nextCompletedModules) {
+  const previous = await db(
+    "SELECT completed_modules_json FROM user_progress WHERE user_id = ?",
+    [userId],
+  );
+
+  const alreadyCompleted = new Set(
+    JSON.parse(previous[0]?.completed_modules_json || "[]"),
+  );
+
+  for (const moduleId of nextCompletedModules) {
+    if (!alreadyCompleted.has(moduleId)) {
+      await recordModuleCompletion(userId, moduleId);
+    }
+  }
+}
+
 http
   .createServer(async (req, res) => {
     try {
@@ -401,6 +468,15 @@ http
         return json(res, 201, (await getModules(body.id, { admin: true }))[0]);
       }
 
+      if (
+        url.pathname.startsWith("/admin/modules/") &&
+        url.pathname.endsWith("/completions") &&
+        req.method === "GET"
+      ) {
+        const id = decodeURIComponent(url.pathname.split("/")[3]);
+        return json(res, 200, await getModuleCompletionStats(id));
+      }
+
       if (url.pathname.startsWith("/admin/modules/")) {
         const id = decodeURIComponent(url.pathname.split("/")[3]);
 
@@ -421,27 +497,25 @@ http
         }
       }
 
-      // ── Stats: tägl. Modulabschlüsse (Admin) ──────────────────────────────
       if (
         url.pathname === "/admin/stats/module-completions-daily" &&
         req.method === "GET"
       ) {
         const rows = await db(
           `SELECT
-             m.id        AS moduleId,
-             m.title     AS title,
-             DATE(c.completed_at) AS day,
+             m.id AS moduleId,
+             m.title AS title,
+             date(c.completed_at) AS day,
              COUNT(c.id) AS completions
            FROM learning_modules m
            LEFT JOIN module_completions c ON c.module_id = m.id
-           GROUP BY m.id, DATE(c.completed_at)
+           GROUP BY m.id, date(c.completed_at)
            ORDER BY m.sort_order, day`,
         );
 
         return json(res, 200, rows);
       }
 
-      // ── Stats: Gesamtübersicht (Admin) ────────────────────────────────────
       if (url.pathname === "/admin/stats/overview" && req.method === "GET") {
         const [users, mods, completions] = await Promise.all([
           db("SELECT COUNT(*) AS count FROM users"),
@@ -461,28 +535,23 @@ http
         url.pathname.endsWith("/complete") &&
         req.method === "POST"
       ) {
-        const parts = url.pathname.split("/");
-        const moduleId = decodeURIComponent(parts[2]);
+        const moduleId = decodeURIComponent(url.pathname.split("/")[2]);
         const auth = verifyToken(req);
         const body = await readBody(req);
 
-        const userId = auth?.sub || body.anonymousId;
+        const anonymousId = String(body.anonymousId || "")
+          .replace(/[^a-zA-Z0-9:-]/g, "")
+          .slice(0, 80);
 
-        if (!userId) {
-          return json(res, 400, { error: "userId oder anonymousId fehlt." });
-        }
+        const userId = auth?.sub || `anonymous:${anonymousId || crypto.randomUUID()}`;
 
-        await db(
-          `INSERT INTO module_completions (id, user_id, module_id)
-           VALUES (?, ?, ?)`,
-          [crypto.randomUUID(), userId, moduleId],
-        );
-
-        return json(res, 201, { ok: true });
+        await recordModuleCompletion(userId, moduleId);
+        return json(res, 200, { ok: true });
       }
 
       if (url.pathname === "/modules" && req.method === "GET") {
         const published = await getModules();
+
         return json(
           res,
           200,
@@ -522,7 +591,10 @@ http
 
         await db("INSERT INTO user_progress (user_id) VALUES (?)", [user.id]);
 
-        return json(res, 201, { token: signToken(user), user });
+        return json(res, 201, {
+          token: signToken(user),
+          user,
+        });
       }
 
       if (url.pathname === "/auth/logout" && req.method === "POST") {
@@ -531,6 +603,7 @@ http
 
       if (url.pathname === "/auth/login" && req.method === "POST") {
         const { email, password } = await readBody(req);
+
         const rows = await db("SELECT * FROM users WHERE email = ?", [
           String(email || "").toLowerCase(),
         ]);
@@ -539,7 +612,9 @@ http
           !rows[0] ||
           !(await verifyPassword(password || "", rows[0].password_hash))
         ) {
-          return json(res, 401, { error: "Ungültige Zugangsdaten." });
+          return json(res, 401, {
+            error: "Ungültige Zugangsdaten.",
+          });
         }
 
         const user = {
@@ -548,7 +623,10 @@ http
           displayName: rows[0].display_name,
         };
 
-        return json(res, 200, { token: signToken(user), user });
+        return json(res, 200, {
+          token: signToken(user),
+          user,
+        });
       }
 
       if (url.pathname === "/me" && req.method === "GET") {
@@ -569,7 +647,6 @@ http
           : json(res, 404, { error: "User nicht gefunden." });
       }
 
-      // ── Modulabschluss speichern ───────────────────────────────────────────
       if (url.pathname === "/me/module-completion" && req.method === "POST") {
         const auth = verifyToken(req);
         if (!auth) return json(res, 401, { error: "Nicht angemeldet." });
@@ -580,13 +657,8 @@ http
           return json(res, 400, { error: "moduleId fehlt." });
         }
 
-        await db(
-          `INSERT INTO module_completions (id, user_id, module_id)
-           VALUES (?, ?, ?)`,
-          [crypto.randomUUID(), auth.sub, moduleId],
-        );
-
-        return json(res, 201, { ok: true });
+        await recordModuleCompletion(auth.sub, moduleId);
+        return json(res, 200, { ok: true });
       }
 
       if (url.pathname === "/me/progress") {
@@ -618,60 +690,39 @@ http
         if (req.method === "PUT") {
           const progress = await readBody(req);
 
-          // Vorhandenen Stand laden, damit partielle Updates keinen Progress resetten
-          const existingRows = await db(
-            "SELECT * FROM user_progress WHERE user_id = ?",
-            [auth.sub],
-          );
-          const existing = existingRows[0] || {};
-
-          const level = progress.level ?? existing.level ?? null;
-          const completedModules =
-            progress.completedModules ??
-            JSON.parse(existing.completed_modules_json || "[]");
-          const quizScores =
-            progress.quizScores ??
-            JSON.parse(existing.quiz_scores_json || "{}");
-          const totalProgress =
-            progress.totalProgress ?? existing.total_progress ?? 0;
-          const trophies =
-            progress.trophies ?? JSON.parse(existing.trophies_json || "[]");
+          await recordNewCompletions(auth.sub, progress.completedModules || []);
 
           await db(
             `INSERT INTO user_progress
              (user_id,level,completed_modules_json,quiz_scores_json,total_progress,trophies_json,updated_at)
              VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)
              ON CONFLICT(user_id) DO UPDATE SET
-               level = excluded.level,
-               completed_modules_json = excluded.completed_modules_json,
-               quiz_scores_json = excluded.quiz_scores_json,
-               total_progress = excluded.total_progress,
-               trophies_json = excluded.trophies_json,
-               updated_at = CURRENT_TIMESTAMP`,
+               level=excluded.level,
+               completed_modules_json=excluded.completed_modules_json,
+               quiz_scores_json=excluded.quiz_scores_json,
+               total_progress=excluded.total_progress,
+               trophies_json=excluded.trophies_json,
+               updated_at=CURRENT_TIMESTAMP`,
             [
               auth.sub,
-              level,
-              JSON.stringify(completedModules),
-              JSON.stringify(quizScores),
-              totalProgress,
-              JSON.stringify(trophies),
+              progress.level || null,
+              JSON.stringify(progress.completedModules || []),
+              JSON.stringify(progress.quizScores || {}),
+              progress.totalProgress || 0,
+              JSON.stringify(progress.trophies || []),
             ],
           );
 
-          return json(res, 200, {
-            level,
-            completedModules,
-            quizScores,
-            totalProgress,
-            trophies,
-          });
+          return json(res, 200, progress);
         }
       }
 
       return json(res, 404, { error: "Route nicht gefunden." });
     } catch (error) {
       console.error(error);
-      return json(res, 500, { error: error.message || "Serverfehler" });
+      return json(res, 500, {
+        error: error.message || "Serverfehler",
+      });
     }
   })
   .listen(PORT, () => console.log(`KAI API läuft auf Port ${PORT}`));
