@@ -103,6 +103,13 @@ async function db(sql, args = []) {
   );
 }
 
+async function ensureColumn(tableName, columnName, definition) {
+  const columns = await db(`PRAGMA table_info(${tableName})`);
+  if (!columns.some((column) => column.name === columnName)) {
+    await db(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 async function migrate() {
   const statements = readFileSync(
     new URL("./schema.sql", `file://${__dirname}/`),
@@ -115,6 +122,12 @@ async function migrate() {
   for (const statement of statements) {
     await db(statement);
   }
+
+  await ensureColumn(
+    "user_progress",
+    "level_progress_json",
+    "TEXT NOT NULL DEFAULT '{}'",
+  );
 
   // Sicherheit: existiert auch, falls schema.sql im Deployment veraltet ist.
   await db(
@@ -708,6 +721,7 @@ http
             quizScores: JSON.parse(row.quiz_scores_json || "{}"),
             totalProgress: row.total_progress || 0,
             trophies: JSON.parse(row.trophies_json || "[]"),
+            levelProgress: JSON.parse(row.level_progress_json || "{}"),
           });
         }
 
@@ -718,13 +732,14 @@ http
 
           await db(
             `INSERT INTO user_progress
-             (user_id,level,completed_modules_json,quiz_scores_json,total_progress,trophies_json,updated_at)
-             VALUES (?,?,?,?,?,?,CURRENT_TIMESTAMP)
+             (user_id,level,completed_modules_json,quiz_scores_json,total_progress,level_progress_json,trophies_json,updated_at)
+             VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
              ON CONFLICT(user_id) DO UPDATE SET
                level=excluded.level,
                completed_modules_json=excluded.completed_modules_json,
                quiz_scores_json=excluded.quiz_scores_json,
                total_progress=excluded.total_progress,
+               level_progress_json=excluded.level_progress_json,
                trophies_json=excluded.trophies_json,
                updated_at=CURRENT_TIMESTAMP`,
             [
@@ -733,6 +748,7 @@ http
               JSON.stringify(progress.completedModules || []),
               JSON.stringify(progress.quizScores || {}),
               progress.totalProgress || 0,
+              JSON.stringify(progress.levelProgress || {}),
               JSON.stringify(progress.trophies || []),
             ],
           );
